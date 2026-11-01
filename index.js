@@ -2,6 +2,9 @@
 import { extension_settings, getContext } from "../../../extensions.js";
 import { saveSettingsDebounced, callPopup, getRequestHeaders, saveChat, reloadCurrentChat, saveCharacterDebounced } from "../../../../script.js";
 
+import { requestIsolatedMainApi } from "./main-api-isolation.js";
+import { saveCurrentPersona } from "./persona-save.js";
+
 const extensionName = "st-persona-weaver";
 const CURRENT_VERSION = "3.4.6"; // Lifecycle/Timeline exception for not-yet-happened fields
 
@@ -1209,23 +1212,10 @@ async function runGeneration(data, apiConfig, isTemplateMode = false) {
                 }
                 throw new Error("无法解析 API 返回格式");
             } else {
-                if (window.TavernHelper && typeof window.TavernHelper.generateRaw === 'function') {
-                    // should_stream 让 TavernHelper 走流式管道，避免 Cloudflare / 酒馆 Node 后端
-                    // 在等完整响应时 504。generateRaw 内部会累积 token 后一次性返回完整字符串。
-                    return await window.TavernHelper.generateRaw({
-                        user_input: '', 
-                        ordered_prompts: messages,
-                        overrides: { 
-                            world_info_before: '', world_info_after: '', persona_description: '', 
-                            char_description: '', char_personality: '', scenario: '', dialogue_examples: '',
-                            chat_history: { prompts: [], with_depth_entries: false, author_note: '' }
-                        },
-                        injects: [], max_chat_history: 0,
-                        should_stream: useStream
-                    });
-                } else {
-                    throw new Error("ST版本过旧或未安装 TavernHelper");
-                }
+                return await requestIsolatedMainApi(messages, {
+                    signal: controller.signal,
+                    stream: useStream,
+                });
             }
         };
 
@@ -1244,7 +1234,7 @@ async function runGeneration(data, apiConfig, isTemplateMode = false) {
             const isBadRequest = errLower.includes('400') || errLower.includes('bad request') || errLower.includes('invalid');
 
             if (timedOutBySelf || (isAbort && controller.signal.aborted)) {
-                throw new Error(`请求超时 (${timeoutSec}s)：第三方 / Claude 中转站响应过慢。可在「API 设置 → 请求超时」里调大该值（建议 300~600 秒），或检查中转站 / 网络稳定性。`);
+                throw new Error(`请求超时 (${timeoutSec}s)：${apiConfig.apiSource === 'independent' ? '独立 API' : '主 API'} 响应过慢。请调大人设生成的请求超时，或检查 API / 网络状态。`);
             }
 
             if (prefillContent && isBadRequest) {
@@ -1654,21 +1644,6 @@ function compressImage(base64, maxSize = 512, quality = 0.7) {
         img.onerror = () => resolve(base64);
         img.src = base64;
     });
-}
-
-async function forceSavePersona(name, description) {
-    const context = getContext();
-    if (!context.powerUserSettings.personas) context.powerUserSettings.personas = {};
-    context.powerUserSettings.personas[name] = description;
-    context.powerUserSettings.persona_selected = name;
-    const $nameInput = $('#your_name');
-    const $descInput = $('#persona_description');
-    if ($nameInput.length) $nameInput.val(name).trigger('input').trigger('change');
-    if ($descInput.length) $descInput.val(description).trigger('input').trigger('change');
-    const $h5Name = $('h5#your_name');
-    if ($h5Name.length) $h5Name.text(name);
-    await saveSettingsDebounced();
-    return true;
 }
 
 // [Fix 15] Universal Smart Keyword Logic
@@ -3756,10 +3731,19 @@ function bindEvents() {
     $(document).on('click.pw', '#pw-btn-apply', async function () {
         const content = $('#pw-result-text').val();
         if (!content) return toastr.warning("内容为空");
-        const name = $('.persona_name').first().text().trim() || $('h5#your_name').text().trim() || "User";
-        await forceSavePersona(name, content);
-        toastr.success(TEXT.TOAST_SAVE_SUCCESS(name));
-        $('.popup_close').click();
+        const $button = $(this);
+        if ($button.prop('disabled')) return;
+        $button.prop('disabled', true);
+        try {
+            const { name } = await saveCurrentPersona(content);
+            toastr.success(TEXT.TOAST_SAVE_SUCCESS(name));
+            $('.popup_close').click();
+        } catch (error) {
+            console.error('[PW] 人设保存失败:', error);
+            toastr.error('人设保存失败：' + (error.message || String(error)));
+        } finally {
+            $button.prop('disabled', false);
+        }
     });
 
     $(document).on('click.pw', '#pw-clear', function () {
